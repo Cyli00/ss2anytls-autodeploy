@@ -4,7 +4,7 @@ autodeploy ss-anytls tunnel between server B &amp; C with sing-box core.
 ## 🎯 工作流程
 
 ```
-curl -O https://raw.githubusercontent.com/Cyli00/ss-anytls-tunnel-autodeploy/refs/heads/main/autodeploy.sh
+curl -O https://raw.githubusercontent.com/Cyli00/ss2anytls-autodeploy/refs/heads/main/autodeploy.sh
 chmod +x autodeploy.sh
 bash autodeploy.sh
 ```
