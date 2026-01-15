@@ -182,7 +182,7 @@ logic_C() {
     # C端配置：Inbound 使用 anytls 类型，开启 TLS 并指向本地证书
     cat > $SB_CONFIG <<EOF
 {
-  "log": { "level": "info", "timestamp": true },
+  "log": { "level": "warn"},
   "inbounds": [
     {
       "type": "anytls",
