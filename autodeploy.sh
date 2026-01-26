@@ -162,6 +162,10 @@ logic_C() {
     # 端口和Tag设置
     read -p "   Set Listen Port [Default 8443]: " listen_port
     listen_port=${listen_port:-8443}
+
+    # TLS server_name 设置（可选）
+    read -p "   TLS Server Name (留空则不添加): " tls_server_name
+    tls_server_name=${tls_server_name:-""}
     
     # 检查端口冲突
     if jq -e ".inbounds[]? | select(.listen_port == $listen_port)" "$SB_CONFIG" >/dev/null 2>&1; then
@@ -207,24 +211,47 @@ logic_C() {
     print_info "Appending AnyTLS Inbound via jq..."
 
     # 构造 Inbound (AnyTLS)
-    json_ib=$(jq -n \
-        --arg tag "$user_tag" \
-        --arg port "$listen_port" \
-        --arg pass "$anytls_password" \
-        --arg crt "$crt_path" \
-        --arg key "$key_path" \
-        '{
-            type: "anytls",
-            tag: $tag,
-            listen: "::",
-            listen_port: ($port|tonumber),
-            users: [ { name: "user1", password: $pass } ],
-            tls: {
-                enabled: true,
-                certificate_path: $crt,
-                key_path: $key
-            }
-        }')
+    if [[ -n "$tls_server_name" ]]; then
+        json_ib=$(jq -n \
+            --arg tag "$user_tag" \
+            --arg port "$listen_port" \
+            --arg pass "$anytls_password" \
+            --arg crt "$crt_path" \
+            --arg key "$key_path" \
+            --arg sni "$tls_server_name" \
+            '{
+                type: "anytls",
+                tag: $tag,
+                listen: "::",
+                listen_port: ($port|tonumber),
+                users: [ { name: "user1", password: $pass } ],
+                tls: {
+                    enabled: true,
+                    certificate_path: $crt,
+                    key_path: $key,
+                    server_name: $sni
+                }
+            }')
+    else
+        json_ib=$(jq -n \
+            --arg tag "$user_tag" \
+            --arg port "$listen_port" \
+            --arg pass "$anytls_password" \
+            --arg crt "$crt_path" \
+            --arg key "$key_path" \
+            '{
+                type: "anytls",
+                tag: $tag,
+                listen: "::",
+                listen_port: ($port|tonumber),
+                users: [ { name: "user1", password: $pass } ],
+                tls: {
+                    enabled: true,
+                    certificate_path: $crt,
+                    key_path: $key
+                }
+            }')
+    fi
 
     # 写入配置
     tmp=$(mktemp)
@@ -242,11 +269,22 @@ logic_C() {
         public_ip=$(curl -4 -s --max-time 3 ifconfig.me)
 
         print_success "Server C Inbound Added!"
-        print_card "Copy to Server B" \
-            "IP       : $public_ip" \
-            "Port     : $listen_port" \
-            "Password : $anytls_password" \
-            "Tag      : $user_tag"
+
+        # 根据是否有 server_name 动态生成输出
+        if [[ -n "$tls_server_name" ]]; then
+            print_card "Copy to Server B" \
+                "IP          : $public_ip" \
+                "Port        : $listen_port" \
+                "Password    : $anytls_password" \
+                "Server Name : $tls_server_name" \
+                "Tag         : $user_tag"
+        else
+            print_card "Copy to Server B" \
+                "IP       : $public_ip" \
+                "Port     : $listen_port" \
+                "Password : $anytls_password" \
+                "Tag      : $user_tag"
+        fi
         
         # 引导步骤
         echo -e "${YELLOW}╔══════════════════════════════════════════════╗${NC}"
@@ -293,7 +331,9 @@ logic_B() {
     read -p "   C Server IP: " c_ip
     read -p "   C Server Port: " c_port
     read -p "   C AnyTLS Password: " c_pass
-    
+    read -p "   C TLS Server Name (留空则不添加): " c_server_name
+    c_server_name=${c_server_name:-""}
+
     if [[ -z "$c_ip" || -z "$c_pass" ]]; then print_error "Empty input!"; exit 1; fi
 
     # 2. B 端入站设置
@@ -354,22 +394,43 @@ logic_B() {
         }')
 
     # --- 构造 Outbound (Pure AnyTLS) ---
-    json_ob=$(jq -n \
-        --arg tag "$ob_tag" \
-        --arg server "$c_ip" \
-        --arg port "$c_port" \
-        --arg pass "$c_pass" \
-        '{
-            type: "anytls",
-            tag: $tag,
-            server: $server,
-            server_port: ($port|tonumber),
-            password: $pass,
-            tls: {
-                enabled: true,
-                insecure: true
-            }
-        }')
+    if [[ -n "$c_server_name" ]]; then
+        json_ob=$(jq -n \
+            --arg tag "$ob_tag" \
+            --arg server "$c_ip" \
+            --arg port "$c_port" \
+            --arg pass "$c_pass" \
+            --arg sni "$c_server_name" \
+            '{
+                type: "anytls",
+                tag: $tag,
+                server: $server,
+                server_port: ($port|tonumber),
+                password: $pass,
+                tls: {
+                    enabled: true,
+                    insecure: true,
+                    server_name: $sni
+                }
+            }')
+    else
+        json_ob=$(jq -n \
+            --arg tag "$ob_tag" \
+            --arg server "$c_ip" \
+            --arg port "$c_port" \
+            --arg pass "$c_pass" \
+            '{
+                type: "anytls",
+                tag: $tag,
+                server: $server,
+                server_port: ($port|tonumber),
+                password: $pass,
+                tls: {
+                    enabled: true,
+                    insecure: true
+                }
+            }')
+    fi
 
     # --- 构造 Route Rule ---
     json_rule=$(jq -n --arg ib "$ib_tag" --arg ob "$ob_tag" '{ inbound: $ib, outbound: $ob }')
