@@ -163,9 +163,9 @@ logic_C() {
     read -p "   Set Listen Port [Default 8443]: " listen_port
     listen_port=${listen_port:-8443}
 
-    # TLS server_name 设置（可选）
-    read -p "   TLS Server Name (留空则不添加): " tls_server_name
-    tls_server_name=${tls_server_name:-""}
+    # SNI server_name 设置（可选）
+    read -p "   SNI Server Name (留空则不添加): " sni_server_name
+    sni_server_name=${sni_server_name:-""}
     
     # 检查端口冲突
     if jq -e ".inbounds[]? | select(.listen_port == $listen_port)" "$SB_CONFIG" >/dev/null 2>&1; then
@@ -211,14 +211,14 @@ logic_C() {
     print_info "Appending AnyTLS Inbound via jq..."
 
     # 构造 Inbound (AnyTLS)
-    if [[ -n "$tls_server_name" ]]; then
+    if [[ -n "$sni_server_name" ]]; then
         json_ib=$(jq -n \
             --arg tag "$user_tag" \
             --arg port "$listen_port" \
             --arg pass "$anytls_password" \
             --arg crt "$crt_path" \
             --arg key "$key_path" \
-            --arg sni "$tls_server_name" \
+            --arg sni "$sni_server_name" \
             '{
                 type: "anytls",
                 tag: $tag,
@@ -271,12 +271,12 @@ logic_C() {
         print_success "Server C Inbound Added!"
 
         # 根据是否有 server_name 动态生成输出
-        if [[ -n "$tls_server_name" ]]; then
+        if [[ -n "$sni_server_name" ]]; then
             print_card "Copy to Server B" \
                 "IP          : $public_ip" \
                 "Port        : $listen_port" \
                 "Password    : $anytls_password" \
-                "Server Name : $tls_server_name" \
+                "SNI server name : $sni_server_name" \
                 "Tag         : $user_tag"
         else
             print_card "Copy to Server B" \
@@ -331,7 +331,7 @@ logic_B() {
     read -p "   C Server IP: " c_ip
     read -p "   C Server Port: " c_port
     read -p "   C AnyTLS Password: " c_pass
-    read -p "   C TLS Server Name (留空则不添加): " c_server_name
+    read -p "   C SNI Server Name (留空则不添加): " c_server_name
     c_server_name=${c_server_name:-""}
 
     if [[ -z "$c_ip" || -z "$c_pass" ]]; then print_error "Empty input!"; exit 1; fi
