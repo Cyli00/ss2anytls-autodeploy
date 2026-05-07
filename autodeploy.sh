@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==========================================
-# LeiKwan Host - Sing-box Pure AnyTLS Setup
+# ss2anytls-autodeploy - Sing-box AnyTLS 部署脚本
 # ==========================================
 
 # --- 颜色定义 ---
@@ -55,15 +55,15 @@ print_card() {
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        print_error "Please run as root: sudo ./auto-anytls-pure.sh"
+        print_error "请使用 root 权限运行：sudo ./autodeploy.sh"
         exit 1
     fi
 }
 
 install_dependencies() {
     # 安装 jq, openssl, curl
-    if ! command -v jq &> /dev/null || ! command -v openssl &> /dev/null; then
-        print_info "Installing dependencies (jq, openssl)..."
+    if ! command -v jq &> /dev/null || ! command -v openssl &> /dev/null || ! command -v curl &> /dev/null; then
+        print_info "Installing dependencies (jq, openssl, curl)..."
         if [ -x "$(command -v apt)" ]; then
             apt update -qq && apt install -y jq openssl curl wget tar > /dev/null
         elif [ -x "$(command -v yum)" ]; then
@@ -71,6 +71,13 @@ install_dependencies() {
             yum install -y jq openssl curl wget tar > /dev/null
         fi
     fi
+
+    for dep in jq openssl curl; do
+        if ! command -v "$dep" &> /dev/null; then
+            print_error "缺少依赖：$dep"
+            exit 1
+        fi
+    done
 
     # 检查并安装 Sing-box
     if command -v sing-box &> /dev/null; then
@@ -86,11 +93,96 @@ install_dependencies() {
     fi
 
     # 创建证书目录
-    mkdir -p $SB_CERT_DIR
+    mkdir -p "$SB_CERT_DIR"
 }
 
 gen_ss2022_key() { openssl rand -base64 16; }
 gen_anytls_pass() { openssl rand -base64 16; }
+
+base64_no_wrap() { printf '%s' "$1" | base64 | tr -d '\n'; }
+
+url_encode() {
+    local value="$1"
+    local encoded=""
+    local char hex i
+    local LC_ALL=C
+    for (( i = 0; i < ${#value}; i++ )); do
+        char="${value:i:1}"
+        case "$char" in
+            [a-zA-Z0-9.~_-]) encoded+="$char" ;;
+            *) printf -v hex '%%%02X' "'$char"; encoded+="$hex" ;;
+        esac
+    done
+    printf '%s' "$encoded"
+}
+
+valid_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+}
+
+require_valid_port() {
+    local port="$1"
+    local label="$2"
+    if ! valid_port "$port"; then
+        print_error "${label}无效：$port"
+        exit 1
+    fi
+}
+
+normalize_tag() {
+    local raw="$1"
+    local fallback="$2"
+    local normalized
+    normalized=$(printf '%s' "$raw" | sed 's/[^a-zA-Z0-9-]//g')
+    printf '%s' "${normalized:-$fallback}"
+}
+
+get_public_ipv4() {
+    local endpoint public_ip
+    for endpoint in https://api.ipify.org https://ifconfig.me https://icanhazip.com; do
+        public_ip=$(curl -4 -fsS --max-time 5 "$endpoint" 2>/dev/null | tr -d '[:space:]')
+        if [[ "$public_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+            echo "$public_ip"
+            return 0
+        fi
+    done
+    return 1
+}
+
+prompt_public_host() {
+    local label="$1"
+    local public_host
+    if public_host=$(get_public_ipv4); then
+        echo "$public_host"
+        return 0
+    fi
+
+    print_warn "无法自动获取公网 IP"
+    read -p "   ${label}公网 Host/IP: " public_host
+    if [[ -z "$public_host" ]]; then
+        print_error "公网地址为空，无法生成有效 URI"
+        exit 1
+    fi
+    echo "$public_host"
+}
+
+apply_config_update() {
+    local filter="$1"
+    local tmp
+    tmp=$(mktemp) || { print_error "创建临时配置文件失败"; exit 1; }
+
+    if ! jq "$filter" "$SB_CONFIG" > "$tmp"; then
+        rm -f "$tmp"
+        print_error "写入 sing-box 配置失败"
+        exit 1
+    fi
+
+    if ! mv "$tmp" "$SB_CONFIG"; then
+        rm -f "$tmp"
+        print_error "替换 sing-box 配置失败"
+        exit 1
+    fi
+}
 
 # 生成自签证书 (用于 C 端)
 gen_self_signed_cert() {
@@ -114,14 +206,16 @@ gen_ss_uri() {
     local password="$2"
     local host="$3"
     local port="$4"
-    local name="${5:-LeiKwan-SS}"
+    local name="${5:-ss2anytls-SS}"
 
     # Base64编码 method:password
     local userinfo="${method}:${password}"
-    local encoded=$(echo -n "$userinfo" | base64 -w 0 2>/dev/null || echo -n "$userinfo" | base64)
+    local encoded
+    encoded=$(base64_no_wrap "$userinfo")
 
     # URL编码节点名称
-    local encoded_name=$(echo -n "$name" | xxd -plain | tr -d '\n' | sed 's/\(..\)/%\1/g')
+    local encoded_name
+    encoded_name=$(url_encode "$name")
 
     # 生成完整URI
     echo "ss://${encoded}@${host}:${port}?udp=1#${encoded_name}"
@@ -132,20 +226,24 @@ gen_anytls_uri() {
     local password="$1"
     local host="$2"
     local port="$3"
-    local name="${4:-LeiKwan-AnyTLS}"
+    local name="${4:-ss2anytls-AnyTLS}"
     local sni="$5"
 
-    # Base64编码 password
-    local encoded=$(echo -n "$password" | base64 -w 0 2>/dev/null || echo -n "$password" | base64)
+    local encoded_userinfo
+    # AnyTLS URI 的 auth 是实际密码，base64 密码里的保留字符需要百分号编码
+    encoded_userinfo=$(url_encode "$password")
 
     # URL编码节点名称
-    local encoded_name=$(echo -n "$name" | xxd -plain | tr -d '\n' | sed 's/\(..\)/%\1/g')
+    local encoded_name
+    encoded_name=$(url_encode "$name")
 
     # 生成完整URI
     if [[ -n "$sni" ]]; then
-        echo "anytls://${encoded}@${host}:${port}?insecure=1&sni=${sni}#${encoded_name}"
+        local encoded_sni
+        encoded_sni=$(url_encode "$sni")
+        echo "anytls://${encoded_userinfo}@${host}:${port}?insecure=1&sni=${encoded_sni}#${encoded_name}"
     else
-        echo "anytls://${encoded}@${host}:${port}?insecure=1#${encoded_name}"
+        echo "anytls://${encoded_userinfo}@${host}:${port}?insecure=1#${encoded_name}"
     fi
 }
 
@@ -178,12 +276,13 @@ logic_C() {
     # 备份现有配置
     if [ -f "$SB_CONFIG" ]; then
         print_info "Config exists. Appending new inbound..."
-        cp $SB_CONFIG "${SB_CONFIG}.bak"
+        cp "$SB_CONFIG" "${SB_CONFIG}.bak"
     fi
 
     # 端口和Tag设置
     read -p "   Set Listen Port [Default 8443]: " listen_port
     listen_port=${listen_port:-8443}
+    require_valid_port "$listen_port" "C 端监听端口"
 
     # SNI server_name 设置（可选）
     read -p "   SNI Server Name (留空则不添加): " sni_server_name
@@ -201,7 +300,7 @@ logic_C() {
         read -p "   Tag Name (英文/数字/短横线) [anytls-in]: " user_tag
         user_tag=${user_tag:-"anytls-in"}
         # 清理 tag，只保留字母数字和短横线
-        user_tag=$(echo "$user_tag" | sed 's/[^a-zA-Z0-9-]//g')
+        user_tag=$(normalize_tag "$user_tag" "anytls-in")
         
         # 检查 tag 是否已存在
         if check_tag_exists "$user_tag"; then
@@ -209,8 +308,7 @@ logic_C() {
             read -p "   是否覆盖现有配置? [y/N]: " overwrite
             if [[ "$overwrite" =~ ^[Yy]$ ]]; then
                 # 删除旧的 inbound
-                tmp=$(mktemp)
-                jq "del(.inbounds[] | select(.tag == \"$user_tag\"))" "$SB_CONFIG" > "$tmp" && mv "$tmp" "$SB_CONFIG"
+                apply_config_update "del(.inbounds[] | select(.tag == \"$user_tag\"))"
                 print_success "已删除旧配置"
                 break
             else
@@ -224,8 +322,8 @@ logic_C() {
 
     # 1. 生成证书
     cert_paths=$(gen_self_signed_cert)
-    crt_path=$(echo $cert_paths | cut -d'|' -f1)
-    key_path=$(echo $cert_paths | cut -d'|' -f2)
+    crt_path=${cert_paths%%|*}
+    key_path=${cert_paths#*|}
 
     # 2. 生成密码
     anytls_password=$(gen_anytls_pass)
@@ -276,19 +374,18 @@ logic_C() {
     fi
 
     # 写入配置
-    tmp=$(mktemp)
-    jq ".inbounds += [$json_ib]" $SB_CONFIG > "$tmp" && mv "$tmp" $SB_CONFIG
+    apply_config_update ".inbounds += [$json_ib]"
     
     # 确保有 direct outbound
     if ! jq -e '.outbounds[]? | select(.tag == "direct")' "$SB_CONFIG" >/dev/null 2>&1; then
-        jq '.outbounds += [{"type":"direct","tag":"direct"}]' "$SB_CONFIG" > "$tmp" && mv "$tmp" "$SB_CONFIG"
+        apply_config_update '.outbounds += [{"type":"direct","tag":"direct"}]'
     fi
 
     # 启用并重启服务
     systemctl enable sing-box.service >/dev/null 2>&1
     
     if systemctl restart sing-box.service; then
-        public_ip=$(curl -4 -s --max-time 3 ifconfig.me)
+        public_ip=$(prompt_public_host "C 端")
 
         print_success "Server C Inbound Added!"
 
@@ -332,7 +429,7 @@ logic_C() {
         print_warn "若配置无法使用，可访问 /etc/sing-box/config.json.bak 退回之前配置"
     else
         print_error "服务启动失败！Restoring backup..."
-        cp "${SB_CONFIG}.bak" $SB_CONFIG 2>/dev/null
+        cp "${SB_CONFIG}.bak" "$SB_CONFIG" 2>/dev/null
         systemctl restart sing-box.service
         journalctl -u sing-box.service -n 20 --no-pager
     fi
@@ -367,18 +464,20 @@ logic_B() {
     c_server_name=${c_server_name:-""}
 
     if [[ -z "$c_ip" || -z "$c_pass" ]]; then print_error "Empty input!"; exit 1; fi
+    require_valid_port "$c_port" "C 端端口"
 
     # 2. B 端入站设置
     echo -e "\n${YELLOW}? Local Inbound Settings${NC}"
     read -p "   Local Listen Port [Random]: " local_port
     local_port=${local_port:-$(shuf -i 20000-30000 -n 1)}
+    require_valid_port "$local_port" "B 端本地监听端口"
     
     # 让用户输入 tag 名称（不再添加时间戳）
     while true; do
         read -p "   Tag Name (英文/数字/短横线) [ss-relay]: " user_tag
         user_tag=${user_tag:-"ss-relay"}
         # 清理 tag，只保留字母数字和短横线
-        user_tag=$(echo "$user_tag" | sed 's/[^a-zA-Z0-9-]//g')
+        user_tag=$(normalize_tag "$user_tag" "ss-relay")
         
         ib_tag="${user_tag}-in"
         ob_tag="${user_tag}-out"
@@ -389,10 +488,9 @@ logic_B() {
             read -p "   是否覆盖现有配置? [y/N]: " overwrite
             if [[ "$overwrite" =~ ^[Yy]$ ]]; then
                 # 删除旧的 inbound/outbound/route
-                tmp=$(mktemp)
-                jq "del(.inbounds[] | select(.tag == \"$ib_tag\"))" "$SB_CONFIG" > "$tmp" && mv "$tmp" "$SB_CONFIG"
-                jq "del(.outbounds[] | select(.tag == \"$ob_tag\"))" "$SB_CONFIG" > "$tmp" && mv "$tmp" "$SB_CONFIG"
-                jq "del(.route.rules[] | select(.inbound == \"$ib_tag\"))" "$SB_CONFIG" > "$tmp" && mv "$tmp" "$SB_CONFIG"
+                apply_config_update "del(.inbounds[] | select(.tag == \"$ib_tag\"))"
+                apply_config_update "del(.outbounds[] | select(.tag == \"$ob_tag\"))"
+                apply_config_update "del(.route.rules[] | select(.inbound == \"$ib_tag\"))"
                 print_success "已删除旧配置"
                 break
             else
@@ -404,8 +502,8 @@ logic_B() {
         fi
     done
     
-    read -p "   Node Display Name [LeiKwan-SS]: " node_name
-    node_name=${node_name:-"LeiKwan-SS"}
+    read -p "   Node Display Name [ss2anytls-SS]: " node_name
+    node_name=${node_name:-"ss2anytls-SS"}
     local_ss_pass=$(gen_ss2022_key)
 
     print_info "Appending Config via jq..."
@@ -468,16 +566,15 @@ logic_B() {
     json_rule=$(jq -n --arg ib "$ib_tag" --arg ob "$ob_tag" '{ inbound: $ib, outbound: $ob }')
 
     # --- 写入 ---
-    tmp=$(mktemp)
-    jq ".inbounds += [$json_ib]" $SB_CONFIG > "$tmp" && mv "$tmp" $SB_CONFIG
-    jq ".outbounds += [$json_ob]" $SB_CONFIG > "$tmp" && mv "$tmp" $SB_CONFIG
-    jq ".route.rules += [$json_rule]" $SB_CONFIG > "$tmp" && mv "$tmp" $SB_CONFIG
+    apply_config_update ".inbounds += [$json_ib]"
+    apply_config_update ".outbounds += [$json_ob]"
+    apply_config_update ".route.rules += [$json_rule]"
 
     # 启用并重启服务
     systemctl enable sing-box.service >/dev/null 2>&1
     
     if systemctl restart sing-box.service; then
-        pub_ip=$(curl -4 -s --max-time 3 ifconfig.me)
+        pub_ip=$(prompt_public_host "B 端")
         
         # 生成 SS URI
         ss_uri=$(gen_ss_uri "2022-blake3-aes-128-gcm" "$local_ss_pass" "$pub_ip" "$local_port" "$node_name")
@@ -503,7 +600,7 @@ logic_B() {
         
     else
         print_error "Failed. Restoring backup..."
-        cp "${SB_CONFIG}.bak" $SB_CONFIG
+        cp "${SB_CONFIG}.bak" "$SB_CONFIG"
         systemctl restart sing-box.service
         journalctl -u sing-box.service -n 10 --no-pager
     fi
