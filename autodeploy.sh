@@ -115,16 +115,38 @@ gen_ss_uri() {
     local host="$3"
     local port="$4"
     local name="${5:-LeiKwan-SS}"
-    
+
     # Base64编码 method:password
     local userinfo="${method}:${password}"
     local encoded=$(echo -n "$userinfo" | base64 -w 0 2>/dev/null || echo -n "$userinfo" | base64)
-    
+
     # URL编码节点名称
     local encoded_name=$(echo -n "$name" | xxd -plain | tr -d '\n' | sed 's/\(..\)/%\1/g')
-    
+
     # 生成完整URI
     echo "ss://${encoded}@${host}:${port}?udp=1#${encoded_name}"
+}
+
+# 生成 AnyTLS URI (用于 C 端导入)
+gen_anytls_uri() {
+    local password="$1"
+    local host="$2"
+    local port="$3"
+    local name="${4:-LeiKwan-AnyTLS}"
+    local sni="$5"
+
+    # Base64编码 password
+    local encoded=$(echo -n "$password" | base64 -w 0 2>/dev/null || echo -n "$password" | base64)
+
+    # URL编码节点名称
+    local encoded_name=$(echo -n "$name" | xxd -plain | tr -d '\n' | sed 's/\(..\)/%\1/g')
+
+    # 生成完整URI
+    if [[ -n "$sni" ]]; then
+        echo "anytls://${encoded}@${host}:${port}?insecure=1&sni=${sni}#${encoded_name}"
+    else
+        echo "anytls://${encoded}@${host}:${port}?insecure=1#${encoded_name}"
+    fi
 }
 
 # 检查 tag 是否存在
@@ -270,6 +292,9 @@ logic_C() {
 
         print_success "Server C Inbound Added!"
 
+        # 生成 AnyTLS URI
+        anytls_uri=$(gen_anytls_uri "$anytls_password" "$public_ip" "$listen_port" "$user_tag" "$sni_server_name")
+
         # 根据是否有 server_name 动态生成输出
         if [[ -n "$sni_server_name" ]]; then
             print_card "Copy to Server B" \
@@ -285,7 +310,14 @@ logic_C() {
                 "Password : $anytls_password" \
                 "Tag      : $user_tag"
         fi
-        
+
+        # 打印 AnyTLS URI
+        echo -e "${CYAN}╔════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${CYAN}║${WHITE} AnyTLS URI (一键导入链接)${CYAN}                              ║${NC}"
+        echo -e "${CYAN}╠════════════════════════════════════════════════════════════╣${NC}"
+        echo -e "${CYAN}║${NC} ${GREEN}$anytls_uri${NC}"
+        echo -e "${CYAN}╚════════════════════════════════════════════════════════════╝${NC}\n"
+
         # 引导步骤
         echo -e "${YELLOW}╔══════════════════════════════════════════════╗${NC}"
         echo -e "${YELLOW}║${WHITE}  下一步操作指引 (Next Steps)${YELLOW}              ║${NC}"
