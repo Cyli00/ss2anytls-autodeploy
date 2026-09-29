@@ -257,7 +257,7 @@ prompt_config() {
     fi
 }
 
-write_config_and_service() {
+write_config() {
     mkdir -p "$CONF_DIR"
     umask 077
     cat > "$CONF_FILE" <<EOF
@@ -266,9 +266,18 @@ PASSWORD=${PASSWORD}
 EOF
     chmod 600 "$CONF_FILE"
     umask 022
+}
 
-    # 监听 ":端口" 即同时监听 IPv4/IPv6；DynamicUser 以低权限运行，
-    # 并通过 AmbientCapabilities 保留绑定 443 等特权端口的能力
+# mode=restricted: 以 nobody 运行，仅保留绑定特权端口的能力
+# mode=root: 兜底方案，用于不支持能力/用户切换的容器环境
+# 刻意不使用 DynamicUser / ProtectSystem / PrivateTmp 等指令，
+# 它们依赖挂载命名空间，在 LXC/OpenVZ 容器中会以 226/NAMESPACE 失败
+write_service() {
+    local mode="$1" sec_block=""
+    if [[ "$mode" == "restricted" ]]; then
+        sec_block=$'User=nobody\nAmbientCapabilities=CAP_NET_BIND_SERVICE\nCapabilityBoundingSet=CAP_NET_BIND_SERVICE\nNoNewPrivileges=yes'
+    fi
+
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=AnyTLS Server (anytls-go)
@@ -282,13 +291,7 @@ ExecStart=${BIN_PATH} -l :\${LISTEN_PORT} -p \${PASSWORD}
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=1048576
-DynamicUser=yes
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-PrivateTmp=yes
+${sec_block}
 
 [Install]
 WantedBy=multi-user.target
@@ -308,12 +311,23 @@ open_firewall() {
     fi
 }
 
+service_ok() {
+    systemctl is-active --quiet "$SERVICE_NAME" && port_in_use "$LISTEN_PORT"
+}
+
 start_service() {
     systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
-    systemctl restart "$SERVICE_NAME"
+    systemctl restart "$SERVICE_NAME" 2>/dev/null
     sleep 2
 
-    if ! systemctl is-active --quiet "$SERVICE_NAME" || ! port_in_use "$LISTEN_PORT"; then
+    if ! service_ok; then
+        print_warn "受限模式启动失败（常见于容器类 VPS），改用 root 模式重试..."
+        write_service root
+        systemctl restart "$SERVICE_NAME" 2>/dev/null
+        sleep 2
+    fi
+
+    if ! service_ok; then
         print_error "服务启动失败，最近日志如下："
         journalctl -u "$SERVICE_NAME" -n 20 --no-pager >&2
         exit 1
@@ -368,7 +382,8 @@ do_install() {
 
     echo -e "\n${YELLOW}? 服务端配置${NC}"
     prompt_config
-    write_config_and_service
+    write_config
+    write_service restricted
     open_firewall "$LISTEN_PORT"
     start_service
 
