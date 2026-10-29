@@ -26,6 +26,8 @@ KEY_FILE="$CONF_DIR/key.pem"
 SYSCTL_FILE="/etc/sysctl.d/99-hysteria.conf"
 SERVICE_NAME="hysteria-server"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+HOP_SERVICE="hysteria-hop"
+HOP_FILE="/etc/systemd/system/${HOP_SERVICE}.service"
 NODE_NAME="hysteria2-exit"
 
 TMP_DIR=""
@@ -266,12 +268,132 @@ ensure_cert() {
     umask 022
 }
 
+# 端口跳跃：服务端仍只监听一个 UDP 端口，由 iptables 把跳跃范围内的 UDP 包重定向过来；
+# 客户端在范围内切换端口，以规避针对单一端口的封锁
+validate_hop_range() {
+    local range="$1" lo hi busy
+    if [[ ! "$range" =~ ^[0-9]+-[0-9]+$ ]]; then
+        print_error "格式应为「起始-结束」，如 20000-50000"
+        return 1
+    fi
+    lo=${range%-*}
+    hi=${range#*-}
+    if ! valid_port "$lo" || ! valid_port "$hi" || (( 10#$lo >= 10#$hi )); then
+        print_error "端口范围无效：$range（需在 1-65535 内且起始小于结束）"
+        return 1
+    fi
+    if (( 10#$LISTEN_PORT >= 10#$lo && 10#$LISTEN_PORT <= 10#$hi )); then
+        print_error "跳跃范围不能包含监听端口 $LISTEN_PORT"
+        return 1
+    fi
+    # 范围内若已有其他 UDP 服务在监听，重定向会使其失效
+    busy=$(ss -lnuH | awk '{print $4}' | grep -oE '[0-9]+$' \
+        | awk -v l="$lo" -v h="$hi" '$1 >= l && $1 <= h' | head -n1)
+    if [[ -n "$busy" ]]; then
+        print_error "跳跃范围内的 UDP 端口 $busy 已被占用，请更换范围"
+        return 1
+    fi
+}
+
+prompt_hop() {
+    local def
+    def="$(read_conf HOP_RANGE)"
+    def="${def:-0}"
+
+    if [[ -z "${HOP_RANGE:-}" ]]; then
+        while true; do
+            read -rp "   端口跳跃范围 (UDP，如 20000-50000，输入 0 不启用) [默认 ${def}]: " HOP_RANGE
+            HOP_RANGE="${HOP_RANGE:-$def}"
+            [[ "$HOP_RANGE" == "0" ]] && break
+            validate_hop_range "$HOP_RANGE" && break
+        done
+    elif [[ "$HOP_RANGE" != "0" ]]; then
+        validate_hop_range "$HOP_RANGE" || exit 1
+    fi
+    [[ "$HOP_RANGE" == "0" ]] && HOP_RANGE=""
+    return 0
+}
+
+ensure_iptables() {
+    if ! command -v iptables &>/dev/null; then
+        print_info "安装 iptables..."
+        if command -v apt-get &>/dev/null; then
+            apt-get update -qq && apt-get install -y -qq iptables >/dev/null
+        elif command -v dnf &>/dev/null; then
+            dnf install -y -q iptables >/dev/null
+        elif command -v yum &>/dev/null; then
+            yum install -y -q iptables >/dev/null
+        elif command -v apk &>/dev/null; then
+            apk add -q iptables >/dev/null
+        fi
+    fi
+    if ! command -v iptables &>/dev/null; then
+        print_error "缺少 iptables，无法启用端口跳跃"
+        exit 1
+    fi
+}
+
+# 用 systemd oneshot 单元维护 NAT 规则，开机自动生效、停止时自动清理
+# 规则先删后加，重复启动不会叠加；IPv6 规则失败不影响 IPv4
+apply_hop() {
+    # 先停止旧单元，让它按旧范围执行 ExecStop 清理规则，再写入新单元
+    systemctl stop "$HOP_SERVICE" 2>/dev/null || true
+    if [[ -z "$HOP_RANGE" ]]; then
+        systemctl disable "$HOP_SERVICE" >/dev/null 2>&1 || true
+        rm -f "$HOP_FILE"
+        systemctl daemon-reload
+        return 0
+    fi
+
+    ensure_iptables
+    local ipt ip6t lo hi match exec_block
+    ipt=$(command -v iptables)
+    ip6t=$(command -v ip6tables || true)
+    lo=${HOP_RANGE%-*}
+    hi=${HOP_RANGE#*-}
+    match="-p udp --dport ${lo}:${hi} -j REDIRECT --to-ports ${LISTEN_PORT}"
+
+    exec_block="ExecStartPre=-${ipt} -t nat -D PREROUTING ${match}
+ExecStart=${ipt} -t nat -A PREROUTING ${match}
+ExecStop=-${ipt} -t nat -D PREROUTING ${match}"
+    if [[ -n "$ip6t" ]]; then
+        exec_block+="
+ExecStartPre=-${ip6t} -t nat -D PREROUTING ${match}
+ExecStart=-${ip6t} -t nat -A PREROUTING ${match}
+ExecStop=-${ip6t} -t nat -D PREROUTING ${match}"
+    fi
+
+    cat > "$HOP_FILE" <<EOF
+[Unit]
+Description=Hysteria 2 port hopping (UDP ${HOP_RANGE} -> ${LISTEN_PORT})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+${exec_block}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now "$HOP_SERVICE" >/dev/null 2>&1
+    if ! systemctl is-active --quiet "$HOP_SERVICE"; then
+        print_error "端口跳跃规则加载失败，最近日志如下："
+        journalctl -u "$HOP_SERVICE" -n 20 --no-pager >&2
+        exit 1
+    fi
+    print_success "端口跳跃已启用：UDP ${HOP_RANGE} -> ${LISTEN_PORT}"
+}
+
 write_config() {
     mkdir -p "$CONF_DIR"
     umask 077
     cat > "$CONF_FILE" <<EOF
 LISTEN_PORT=${LISTEN_PORT}
 PASSWORD=${PASSWORD}
+HOP_RANGE=${HOP_RANGE}
 EOF
     cat > "$YAML_FILE" <<EOF
 listen: :${LISTEN_PORT}
@@ -345,7 +467,7 @@ EOF
 open_firewall() {
     local port="$1"
     if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
-        ufw allow "${port}/udp" >/dev/null 2>&1 && print_info "已在 ufw 放行 ${port}/udp"
+        ufw allow "${port//-/:}/udp" >/dev/null 2>&1 && print_info "已在 ufw 放行 ${port}/udp"
     fi
     if command -v firewall-cmd &>/dev/null && firewall-cmd --state &>/dev/null; then
         firewall-cmd --permanent --add-port="${port}/udp" >/dev/null 2>&1 \
@@ -383,15 +505,26 @@ show_info() {
         exit 1
     fi
 
-    local port pass host uri
+    local port pass hop host uri port_desc sb_ports
     port=$(read_conf LISTEN_PORT)
     pass=$(read_conf PASSWORD)
+    hop=$(read_conf HOP_RANGE)
     host=$(prompt_public_host)
-    uri="hysteria2://${pass}@${host}:${port}/?insecure=1#${NODE_NAME}"
+
+    # 启用跳跃时，客户端直接连接跳跃范围，无需单一端口
+    if [[ -n "$hop" ]]; then
+        uri="hysteria2://${pass}@${host}:${hop}/?insecure=1#${NODE_NAME}"
+        port_desc="${hop} (UDP 跳跃，服务端监听 ${port})"
+        printf -v sb_ports '  "server_ports": ["%s"],\n  "hop_interval": "30s",\n' "${hop/-/:}"
+    else
+        uri="hysteria2://${pass}@${host}:${port}/?insecure=1#${NODE_NAME}"
+        port_desc="${port} (UDP)"
+        printf -v sb_ports '  "server_port": %s,\n' "$port"
+    fi
 
     print_card "Exit Server 信息 (复制到中转 B 端)" \
         "IP       : $host" \
-        "Port     : $port (UDP)" \
+        "Port     : $port_desc" \
         "Password : $pass" \
         "证书     : 服务端自签，客户端需开启 insecure"
 
@@ -404,8 +537,7 @@ show_info() {
   "type": "hysteria2",
   "tag": "${NODE_NAME}",
   "server": "${host}",
-  "server_port": ${port},
-  "password": "${pass}",
+${sb_ports}  "password": "${pass}",
   "tls": {
     "enabled": true,
     "insecure": true
@@ -425,6 +557,7 @@ do_install() {
 
     echo -e "\n${YELLOW}? 服务端配置${NC}"
     prompt_config
+    prompt_hop
     write_config
     ensure_cert
     prepare_files
@@ -432,10 +565,11 @@ do_install() {
     tune_udp_buffers
     open_firewall "$LISTEN_PORT"
     start_service
+    apply_hop
 
     print_success "Hysteria 2 出口服务已启动！"
     show_info
-    print_warn "Hysteria 2 基于 QUIC（UDP），云厂商的安全组/防火墙需放行 UDP ${LISTEN_PORT}"
+    print_warn "Hysteria 2 基于 QUIC（UDP），云厂商的安全组/防火墙需放行 UDP ${LISTEN_PORT}${HOP_RANGE:+ 及跳跃范围 ${HOP_RANGE}}"
     print_warn "管理命令：bash $0 {info|status|log|uninstall}"
 }
 
@@ -446,6 +580,8 @@ do_uninstall() {
         print_info "已取消"
         exit 0
     fi
+    systemctl disable --now "$HOP_SERVICE" >/dev/null 2>&1
+    rm -f "$HOP_FILE"
     systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1
     rm -f "$SERVICE_FILE" "$BIN_PATH" "$SYSCTL_FILE"
     rm -f "$CONF_FILE" "$YAML_FILE" "$CERT_FILE" "$KEY_FILE"
